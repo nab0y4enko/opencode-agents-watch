@@ -1,138 +1,78 @@
-<p align="center">
-  <picture>
-    <source srcset="assets/logo-dark.svg" media="(prefers-color-scheme: dark)">
-    <source srcset="assets/logo-light.svg" media="(prefers-color-scheme: light)">
-    <img src="assets/logo-light.svg" alt="Agents Watcher logo">
-  </picture>
-</p>
+# opencode-agents-watch
 
-<p align="center">Watch and recover every sub-agent at once.</p>
-
-<p align="center">
-  <a href="https://www.npmjs.com/package/opencode-agents-watcher"><img alt="npm" src="https://img.shields.io/npm/v/opencode-agents-watcher?style=flat-square"></a>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
-</p>
-
----
-
-An [OpenCode](https://opencode.ai) TUI plugin that adds a live agents widget to the session sidebar. See which sub-agents are active, what they are doing, how much context they use, and how long they have been running without leaving the parent session.
-
-Expand an agent for its model, current tool, and cost, or open the complete child session with `[view]`.
-
-<p align="center">
-  <img src="assets/opencode-agents-monitor.gif" alt="Agents Watcher sidebar tracking active and completed OpenCode sub-agents">
-</p>
-
-## Why?
-
-Parallel work is useful, but it is easy to lose track of which child sessions are still progressing. Agents Watcher keeps active work visible, moves completed agents into an archived section, and restores useful history when the TUI starts.
-
-The utility is designed to observe sub-agent behavior, provide guarded restart controls when an agent stops progressing or encounters a recoverable problem, and preserve an auditable record of each child session’s activity and recovery state.
-
-## Features
-
-- Live `thinking`, `tool`, `retry`, `done`, and `idle` states
-- The latest tool call while an agent is working
-- Token usage, elapsed time, model, and cost at a glance
-- Expandable rows and a `[view]` action for full child-session details
-- Paginated archived agents for long-running parent sessions
-- Optional timeout supervision with guarded resume or replacement-session recovery
-
-## Installation
-
-If you have OpenCode 1.18.0 or later, install the plugin with:
+An OpenCode 2 TUI sidebar for orchestrator/worker runs. Forked from
+[opencode-agents-watcher](https://github.com/RainingDaemons/opencode-agents-watcher) (MIT); the restart
+supervisor and its `.opencode/` state files are gone, so this version only displays.
 
 ```
-opencode plugin add opencode-agents-watcher@opencode-v1
+▼ Providers · 199k tokens
+Splash
+  35m 38s · 182k · 96 tok/s · 92%
+OpenAI
+  8m 50s · 16k · 41 tok/s · 8%
+
+▼ Agents · 25 runs
+13:03 build
+  OpenAI · GPT-6.2 Sol
+  high
+  49.6s · 1k · 35 tok/s
+  Tvos app's dashboard still use
+  blue color for buttons. why?
+
+12:39 validator
+  Splash · Qwen3.8 Flash Next IQ3_S
+  lite-512 · low effort, think ≤512
+  42.5s · 4k · 95 tok/s
+  Confirm final test plan
 ```
 
-For OpenCode v2:
+**Providers** — all generated tokens (output + reasoning), then for each provider, under its configured
+name: time · tokens · tok/s · share of all tokens. A provider's time is its models' step time (request to
+last token), so tool runs between steps are not in it.
 
-```
-opencode plugin add opencode-agents-watcher@latest
-```
+**Agents** — every model call in the session tree as runs, newest on top: the orchestrator's turns, every
+worker, and context compactions, each attributed to the agent and model of its actual steps, so any
+provider, model or agent switch shows up. An agent's back-to-back rounds share a run; a new prompt to the
+orchestrator always starts one. Each run shows:
 
-## Manual installation
+- start time and agent, plus `running` or `failed`;
+- the provider's configured name and the model (a configured name with no digit, like "Splash Worker", is
+  replaced by a short form of the model ID);
+- the variant and what it does, from its request body (`reasoning_effort`, `thinking_token_budget` or
+  `thinking_budget`);
+- wall time of its rounds · generated tokens · tok/s (streaming only, prompt processing excluded);
+- its tasks: the orchestrator's `subagent` descriptions (matched to briefs by prompt text), your prompt,
+  or `after implementer` when a worker's result woke the orchestrator; at most two lines each;
+- background-job wake-ups, and the current tool while it runs.
 
-Add the package to `~/.config/opencode/opencode.json` (global) or `opencode.json` (project):
+The 8 newest runs are shown; click the "older" line for all. Click a run to open its session, a section
+title to collapse it. Each session's full history is read through the API (the live cache keeps only
+recent messages) and re-read when the session goes idle. Calls that leave nothing in a session, such as
+session titles, can't be shown.
 
-If you have OpenCode 1.18.0 or later, install the plugin with:
+## Install
 
-```json
-{
-  "plugin": ["opencode-agents-watcher@0.1.x"]
-}
-```
-
-For OpenCode v2:
-
-```json
-{
-  "plugin": ["opencode-agents-watcher@0.2.x"]
-}
-```
-
-OpenCode loads the TUI part of the package automatically. Restart OpenCode after changing the configuration.
-
-Upgrading from `0.1.x`: rename the `plugin` key to `plugins`, and use a directory for local plugin paths (for example `.opencode/plugins/agents-watcher/tui.tsx`).
-
-## Usage
-
-| Action | Result |
-| --- | --- |
-| Click `Agents` | Collapse or expand the widget |
-| Click an agent row | Show or hide model, tool, and cost |
-| Click `[view]` | Open the complete child session |
-| Click `[restart]` | Restart an eligible busy agent through the guarded recovery path |
-| Click `Archived (n)` | Show or hide completed agents |
-| Click `[<]` / `[>]` | Move through archived pages |
-| Run `/aw-cleanup` | Confirm and delete persisted watcher data from `.opencode/agents-watcher` |
-
-Status markers breathe while an agent is active; `!` means retrying, and `-` means idle or done.
-
-## Supervision
-
-Create `.opencode/monitor.json` in the project root:
-
-```json
-{
-  "enabled": true,
-  "agents_timeout": "30m",
-  "poll_interval": "10s",
-  "timeout_mode": "busy_only",
-  "restart_mode": "resume",
-  "max_restarts": 2,
-  "auto_restart": true,
-  "confirm_first_restart": true
-}
+```sh
+npm install && npm run build
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `enabled` | Must be `true` before any restart is possible. |
-| `agents_timeout` | Positive duration such as `30s`, `5m`, `30m`, or `2h`. |
-| `poll_interval` | How often the supervisor checks agents; minimum `1s`. |
-| `timeout_mode` | `busy_only` counts busy/retry time; `wall_clock` counts from creation. |
-| `restart_mode` | `resume` prompts the same session; `new_session` creates a replacement child. |
-| `max_restarts` | Maximum persisted recovery attempts per agent. |
-| `auto_restart` | Enables automatic recovery. If `false`, use the manual `[restart]` action. |
-| `confirm_first_restart` | Shows confirmation for manual restart actions. |
+A `plugins` entry in `opencode.jsonc` must be an npm or Git package; a folder path there is silently
+ignored. Load the working copy through the global plugins folder instead (it also survives a profile
+reinstall, which rewrites only `opencode.jsonc` and `AGENTS.md`):
 
-Only busy or retrying child sessions are eligible. Recent activity, question/permission blocks, idle sessions, completed sessions, cooldowns, and the restart limit prevent recovery. Supervision state is stored under `.opencode/agents-watcher/<parent-session-id>/agents.json`.
+```sh
+mkdir -p ~/.config/opencode/plugins/agents-watch
+echo "export { default } from \"$PWD/dist/index.js\"" > ~/.config/opencode/plugins/agents-watch/tui.tsx
+```
 
-## Commands
+Restart OpenCode; the widget sits in the session sidebar (`ctrl+x` `b` toggles the sidebar).
 
-Use `/aw-cleanup` when you want to remove all persisted watcher records for the current project. The command asks for confirmation and does not delete OpenCode sessions, source files, or any data outside `.opencode/agents-watcher`.
+## Develop
 
-## How it works
+Bun comes inside the OpenCode binary (`BUN_BE_BUN=1 opencode …`), so no separate install is needed.
 
-- Registers through the official `sidebar.content` TUI slot.
-- Tracks child sessions from the OpenCode v2 session data cache and event stream.
-- Combines live session status with message content to show activity and the latest tool.
-- Uses session token, cost, and timing data for active and completed agents.
-- Runs supervision on an independent timer and persists guarded recovery state.
-- Keeps tracker state outside the slot component tree so TUI re-renders do not reset it.
-
-## Greetings
-
-This repository is inspired by [opencode-agents-monitor](https://github.com/Dqz00116/opencode-agents-monitor).
+```sh
+npm test            # runs, provider totals, names and formatting (src/runs.ts)
+npm run typecheck
+npm run build       # writes dist/index.js; rebuild and restart OpenCode after changes
+```

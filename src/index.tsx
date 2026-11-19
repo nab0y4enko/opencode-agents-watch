@@ -2,128 +2,61 @@
 import type { SessionInfo, SessionMessageAssistant, SessionMessageAssistantTool } from "@opencode/client"
 import { Plugin } from "@opencode/plugin/tui"
 import type { Context as TuiContext } from "@opencode/plugin/tui/context"
-import { createEffect, createMemo, createRoot, createSignal, For, onCleanup, Show } from "solid-js"
-import { DEFAULT_CONFIG, errorMessage, readMonitorConfig } from "./config"
-import { createFileStateStore } from "./state"
+import { createMemo, createRoot, createSignal, For, Index, onCleanup, Show, type JSX } from "solid-js"
 import {
-  createSupervisor,
-  type AgentRecord,
-  type LiveStatus,
-  type ObservedSession,
-  type SessionDetails,
-  type Supervisor,
-} from "./supervisor"
+  agentRuns,
+  clamp,
+  displayName,
+  formatClock,
+  formatStats,
+  formatTokens,
+  mergeMessages,
+  providerUsage,
+  subagentCalls,
+  truncate,
+  variantSummary,
+  wrap,
+  type AgentRun,
+  type Message,
+  type Model,
+  type ModelFacts,
+} from "./runs"
 
-const ARCHIVED_PAGE_SIZE = 10
-const ACTIVITY_EVENT = /^session\.(step|text|reasoning|tool|compaction)\./
+// History is read in pages of this size, up to this many pages per session.
+const HISTORY_PAGE_SIZE = 200
+const HISTORY_PAGES = 25
+// Events arrive per streamed chunk; redraw at most this often.
+const REDRAW_MS = 250
+// Runs shown before older ones fold away.
+const VISIBLE_RUNS = 8
+// Lines a task or the current tool may take before it is cut.
+const TASK_LINES = 2
+// Widest line the sidebar shows without cutting it.
+const LINE_WIDTH = 36
 
-const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
-
-type Tracker = {
-  active: (parentID: string) => SessionInfo[]
-  archived: (parentID: string) => SessionInfo[]
-  session: (sessionID: string) => SessionInfo | undefined
-  now: () => number
-  breathing: () => number
-  revision: () => number
-  collapsed: () => boolean
-  toggleCollapsed: () => void
-  showArchived: () => boolean
-  toggleArchived: () => void
-  expanded: (sessionID: string, fallback: boolean) => boolean
-  toggleExpanded: (sessionID: string, fallback: boolean) => void
-  archivedPage: (sessionID: string) => number
-  setArchivedPage: (sessionID: string, page: number) => void
-  supervision: () => number
-  bumpSupervision: () => void
-  dispose: () => void
-}
-
-type TrackerHooks = {
-  onSession?: (session: SessionInfo) => void
-  onDeleted?: (sessionID: string) => void
-}
+type Color = TuiContext["theme"]["text"]["base"]
+type SectionID = "providers" | "agents"
 
 type Live = {
-  get: (sessionID: string) => LiveStatus
+  busy: (sessionID: string) => boolean
   dispose: () => void
 }
 
-function agentName(session: SessionInfo) {
-  const title = session.title ?? ""
-  const hit = title.match(/\(@([^\s()]+)\s+subagent\)\s*$/)
-  const name = hit?.[1] ?? session.agent ?? "agent"
-  return name.length > 10 ? `${name.slice(0, 9)}~` : name
+type Tracker = {
+  children: (parentID: string) => SessionInfo[]
+  messages: (sessionID: string) => Message[]
+  facts: (model: Model) => ModelFacts | undefined
+  provider: (providerID: string) => string
+  now: () => number
+  collapsed: (section: SectionID) => boolean
+  toggleCollapsed: (section: SectionID) => void
+  showAll: (sessionID: string) => boolean
+  toggleShowAll: (sessionID: string) => void
+  dispose: () => void
 }
 
-function agentDesc(session: SessionInfo) {
-  const desc = (session.title ?? "").replace(/\s*\(@[^\s()]+\s+subagent\)\s*$/, "")
-  // Keep the metadata row on one line in the narrow sidebar.
-  return desc.length > 24 ? `${desc.slice(0, 21)}...` : desc
-}
-
-function formatTokens(value: number) {
-  if (value >= 1_000_000) return `${Math.round(value / 1_000_000)}m`
-  if (value >= 1000) return `${Math.round(value / 1000)}k`
-  return `${value}`
-}
-
-function formatElapsed(ms: number) {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const seconds = total % 60
-  if (hours > 0) return `${hours}h${String(minutes).padStart(2, "0")}m`
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
-}
-
-function formatDurationShort(ms: number) {
-  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`
-  if (ms % 60_000 === 0) return `${ms / 60_000}m`
-  if (ms % 1000 === 0) return `${ms / 1000}s`
-  return `${Math.round(ms / 1000)}s`
-}
-
-function truncate(value: string, length: number) {
-  return value.length > length ? `${value.slice(0, length - 1)}~` : value
-}
-
-function tokenTotal(tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }) {
-  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
-}
-
-function watchSummary(record: AgentRecord | undefined, config: { maxRestarts: number }) {
-  if (!record) return undefined
-  const count = `restart ${record.restart_count}/${config.maxRestarts}`
-  if (record.status === "timed_out") return `timed out · ${count}`
-  if (record.status === "recovering") return `recovering · ${count}`
-  if (record.status === "restarted") return `restarted · ${count}`
-  if (record.status === "restart_limit") return `restart limit reached · ${count}`
-  if (record.status === "failed") return `recovery failed · ${count}`
-  if (record.restart_count > 0) return count
-  return undefined
-}
-
-function toolSummary(part: SessionMessageAssistantTool) {
-  const input = part.state.input
-  const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {}
-  const detail =
-    typeof input === "string"
-      ? input
-      : (record.command ??
-        record.description ??
-        record.filePath ??
-        record.path ??
-        record.pattern ??
-        record.query ??
-        record.url ??
-        "")
-  const text = detail ? `${part.name} ${String(detail)}` : part.name
-  return text.length > 30 ? `${text.slice(0, 29)}~` : text
-}
-
+// Which sessions are running, from session events plus the status cache.
 function createLive(ctx: TuiContext): Live {
-  const retry = new Set<string>()
   const running = new Set<string>()
   let disposed = false
 
@@ -135,46 +68,21 @@ function createLive(ctx: TuiContext): Live {
     })
     .catch(() => {})
 
+  const stop = (event: { data: { sessionID: string } }) => running.delete(event.data.sessionID)
   const unsubs = [
-    ctx.data.on("session.retry.scheduled", (event) => {
-      retry.add(event.data.sessionID)
-    }),
     ctx.data.on("session.status", (event) => {
-      const sessionID = event.data.sessionID
-      if (event.data.status.type === "idle") running.delete(sessionID)
-      else running.add(sessionID)
-      if (event.data.status.type !== "retry") retry.delete(sessionID)
+      if (event.data.status.type === "idle") running.delete(event.data.sessionID)
+      else running.add(event.data.sessionID)
     }),
-    ctx.data.on("session.execution.started", (event) => {
-      running.add(event.data.sessionID)
-    }),
-    ctx.data.on("session.execution.succeeded", (event) => {
-      running.delete(event.data.sessionID)
-      retry.delete(event.data.sessionID)
-    }),
-    ctx.data.on("session.execution.failed", (event) => {
-      running.delete(event.data.sessionID)
-      retry.delete(event.data.sessionID)
-    }),
-    ctx.data.on("session.execution.interrupted", (event) => {
-      running.delete(event.data.sessionID)
-      retry.delete(event.data.sessionID)
-    }),
-    ctx.data.on("session.step.started", (event) => {
-      running.add(event.data.sessionID)
-      retry.delete(event.data.sessionID)
-    }),
-    ctx.data.on("session.step.ended", (event) => {
-      retry.delete(event.data.sessionID)
-    }),
+    ctx.data.on("session.execution.started", (event) => running.add(event.data.sessionID)),
+    ctx.data.on("session.step.started", (event) => running.add(event.data.sessionID)),
+    ctx.data.on("session.execution.succeeded", stop),
+    ctx.data.on("session.execution.failed", stop),
+    ctx.data.on("session.execution.interrupted", stop),
   ]
 
   return {
-    get(sessionID) {
-      const status = ctx.data.session.status(sessionID)
-      if (status === "running" || running.has(sessionID)) return retry.has(sessionID) ? "retry" : "busy"
-      return "idle"
-    },
+    busy: (sessionID) => ctx.data.session.status(sessionID) === "running" || running.has(sessionID),
     dispose() {
       disposed = true
       for (const unsubscribe of unsubs) unsubscribe()
@@ -182,19 +90,23 @@ function createLive(ctx: TuiContext): Live {
   }
 }
 
-function createTracker(ctx: TuiContext, hooks: TrackerHooks, live: Live): Tracker {
+// Session data shared by every sidebar instance; lives outside the slot tree so
+// re-renders keep it.
+function createTracker(ctx: TuiContext): Tracker {
   return createRoot((dispose) => {
     const [revision, setRevision] = createSignal(0)
-    const touch = () => setRevision((value) => value + 1)
+    // Coalesce bursts of events into one redraw.
+    let redraw: ReturnType<typeof setTimeout> | undefined
+    const touch = () => {
+      if (redraw) return
+      redraw = setTimeout(() => {
+        redraw = undefined
+        setRevision((value) => value + 1)
+      }, REDRAW_MS)
+    }
     const [now, setNow] = createSignal(Date.now())
-    const [breathing, setBreathing] = createSignal(0)
-    const [supervision, setSupervision] = createSignal(0)
-    const [settings, updateSettings] = ctx.storage.store("sidebar", {
-      initial: { collapsed: true, showArchived: false },
-    })
-    const [ui, updateUi] = ctx.storage.memory("ui", {
-      initial: { expanded: {} as Record<string, boolean>, archivedPage: {} as Record<string, number> },
-    })
+    const [sections, updateSections] = ctx.storage.store("sections", { initial: { providers: false, agents: false } })
+    const [ui, updateUi] = ctx.storage.memory("ui", { initial: { showAll: {} as Record<string, boolean> } })
     const [bootstrap, setBootstrap] = createSignal<SessionInfo[]>([])
     let disposed = false
 
@@ -205,580 +117,308 @@ function createTracker(ctx: TuiContext, hooks: TrackerHooks, live: Live): Tracke
       })
       .catch(() => {})
 
-    function sessions() {
+    // Model names, real model IDs, variant settings and provider names.
+    void Promise.all([ctx.data.location.model.sync(), ctx.data.location.provider.sync()])
+      .then(touch)
+      .catch(() => {})
+
+    const sessions = createMemo(() => {
       revision()
       const merged = new Map<string, SessionInfo>()
       for (const session of bootstrap()) merged.set(session.id, session)
       for (const session of ctx.data.session.list()) merged.set(session.id, session)
       return [...merged.values()]
-    }
-
-    function children(parentID: string) {
-      return sessions().filter((session) => session.parentID === parentID)
-    }
-
-    function isDone(session: SessionInfo) {
-      const status = live.get(session.id)
-      if (status === "busy" || status === "retry") return false
-      if (session.time.idle !== undefined || session.outcome !== undefined) return true
-      return now() - session.time.created >= 30_000
-    }
-
-    function doneCount(parentID: string) {
-      return children(parentID).filter(isDone).length
-    }
-
-    createEffect(() => {
-      for (const session of sessions()) {
-        if (session.parentID) hooks.onSession?.(session)
-      }
     })
 
-    const stopEvents = ctx.data.listen(({ details }) => {
-      touch()
-      if (details.type === "session.deleted") {
-        setBootstrap((current) => current.filter((session) => session.id !== details.data.sessionID))
-        hooks.onDeleted?.(details.data.sessionID)
+    // The live cache keeps only recent messages, so read each session's full
+    // history page by page, and again whenever the session goes idle.
+    const history = new Map<string, Message[]>()
+    const loading = new Set<string>()
+    const stale = new Set<string>()
+    async function load(sessionID: string) {
+      if (loading.has(sessionID)) {
+        stale.add(sessionID)
+        return
       }
-    })
-
-    // Hydrate messages lazily so pre-existing child sessions show their latest
-    // activity without syncing every session on every event.
-    const synced = new Set<string>()
-    createEffect(() => {
-      for (const session of sessions()) {
-        if (!session.parentID || synced.has(session.id)) continue
-        synced.add(session.id)
-        void ctx.data.session.message
-          .sync(session.id)
-          .then(touch)
-          .catch(() => {})
+      loading.add(sessionID)
+      const all: Message[] = []
+      try {
+        const seen = new Set<string>()
+        let cursor: string | undefined
+        for (let page = 0; page < HISTORY_PAGES; page += 1) {
+          // The server rejects `order` together with `cursor`; the cursor carries the order.
+          const response = await ctx.client.message.list(
+            cursor ? { sessionID, limit: HISTORY_PAGE_SIZE, cursor } : { sessionID, limit: HISTORY_PAGE_SIZE, order: "asc" },
+          )
+          const fresh = response.data.filter((message) => !seen.has(message.id))
+          for (const message of fresh) seen.add(message.id)
+          all.push(...(fresh as Message[]))
+          cursor = response.cursor.next ?? undefined
+          // The last page still returns a cursor; stop when a page brings nothing new.
+          if (!cursor || fresh.length === 0) break
+        }
+      } catch {
+        // Keep the pages read so far; the live cache fills in the rest.
       }
-    })
+      if (!disposed && all.length > 0) {
+        history.set(sessionID, all)
+        touch()
+      }
+      loading.delete(sessionID)
+      if (stale.delete(sessionID)) void load(sessionID)
+    }
+    const reload = (event: { data: { sessionID: string } }) => {
+      if (history.has(event.data.sessionID)) void load(event.data.sessionID)
+    }
+    const requested = new Set<string>()
+    function ensure(sessionID: string) {
+      if (requested.has(sessionID)) return
+      requested.add(sessionID)
+      void ctx.data.session.message.sync(sessionID).then(touch).catch(() => {})
+      void load(sessionID)
+    }
 
-    const timer = setInterval(() => setNow(Date.now()), 1000)
-    const breathingTimer = setInterval(() => setBreathing((value) => value + 1), 400)
+    // One merge per session per redraw, however many views read it.
+    const merged = new Map<string, { revision: number; messages: Message[] }>()
+
+    const unsubs = [
+      ctx.data.on("session.execution.succeeded", reload),
+      ctx.data.on("session.execution.failed", reload),
+      ctx.data.on("session.execution.interrupted", reload),
+      ctx.data.listen(({ details }) => {
+        touch()
+        if (details.type === "session.deleted") {
+          const sessionID = details.data.sessionID
+          setBootstrap((current) => current.filter((session) => session.id !== sessionID))
+          history.delete(sessionID)
+          merged.delete(sessionID)
+          requested.delete(sessionID)
+        }
+      }),
+    ]
+    const clock = setInterval(() => setNow(Date.now()), 1000)
 
     onCleanup(() => {
       disposed = true
-      clearInterval(timer)
-      clearInterval(breathingTimer)
-      stopEvents()
+      clearInterval(clock)
+      if (redraw) clearTimeout(redraw)
+      for (const unsubscribe of unsubs) unsubscribe()
     })
 
     return {
-      active(parentID) {
-        return children(parentID)
-          .filter((session) => !isDone(session))
-          .sort((left, right) => left.time.created - right.time.created)
+      children: (parentID) => sessions().filter((session) => session.parentID === parentID),
+      messages(sessionID) {
+        const current = revision()
+        ensure(sessionID)
+        const cached = merged.get(sessionID)
+        if (cached?.revision === current) return cached.messages
+        const live = ctx.data.session.message.list(sessionID) as Message[]
+        const messages = mergeMessages(history.get(sessionID) ?? [], live)
+        merged.set(sessionID, { revision: current, messages })
+        return messages
       },
-      archived(parentID) {
-        return children(parentID)
-          .filter(isDone)
-          .sort((left, right) => (right.time.idle ?? right.time.updated) - (left.time.idle ?? left.time.updated))
+      facts(model) {
+        revision()
+        const info = ctx.data.location.model.list()?.find(
+          (item) => item.providerID === model.providerID && item.id === model.id,
+        )
+        if (!info) return undefined
+        return {
+          name: info.name,
+          provider: ctx.data.location.provider.list()?.find((item) => item.id === info.providerID)?.name,
+          modelID: info.modelID,
+          variants: info.variants,
+        }
       },
-      session(sessionID) {
-        return sessions().find((session) => session.id === sessionID)
+      // The provider's configured name, such as "OpenAI" or "Splash".
+      provider(providerID) {
+        revision()
+        return ctx.data.location.provider.list()?.find((item) => item.id === providerID)?.name ?? providerID
       },
       now,
-      breathing,
-      revision,
-      collapsed() {
-        return settings.collapsed
-      },
-      toggleCollapsed() {
-        const next = !settings.collapsed
-        void updateSettings((draft) => {
-          draft.collapsed = next
+      collapsed: (section) => sections[section],
+      toggleCollapsed(section) {
+        const next = !sections[section]
+        void updateSections((draft) => {
+          draft[section] = next
         })
       },
-      showArchived() {
-        return settings.showArchived
-      },
-      toggleArchived() {
-        const next = !settings.showArchived
-        void updateSettings((draft) => {
-          draft.showArchived = next
-        })
-      },
-      expanded(sessionID, fallback) {
-        return ui.expanded[sessionID] ?? fallback
-      },
-      toggleExpanded(sessionID, fallback) {
+      showAll: (sessionID) => ui.showAll[sessionID] ?? false,
+      toggleShowAll(sessionID) {
         updateUi((draft) => {
-          draft.expanded[sessionID] = !(draft.expanded[sessionID] ?? fallback)
+          draft.showAll[sessionID] = !(draft.showAll[sessionID] ?? false)
         })
-      },
-      archivedPage(sessionID) {
-        const pages = Math.max(1, Math.ceil(doneCount(sessionID) / ARCHIVED_PAGE_SIZE))
-        return Math.min(ui.archivedPage[sessionID] ?? 0, pages - 1)
-      },
-      setArchivedPage(sessionID, page) {
-        const pages = Math.max(1, Math.ceil(doneCount(sessionID) / ARCHIVED_PAGE_SIZE))
-        const clamped = Math.max(0, Math.min(page, pages - 1))
-        updateUi((draft) => {
-          draft.archivedPage[sessionID] = clamped
-        })
-      },
-      supervision,
-      bumpSupervision() {
-        setSupervision((value) => value + 1)
       },
       dispose,
     }
   })
 }
 
-function Agent(props: {
-  ctx: TuiContext
-  tracker: Tracker
-  supervisor: Supervisor
-  live: Live
-  session: SessionInfo
-}) {
-  const ctx = props.ctx
-  const theme = () => ctx.theme
-  const session = createMemo(() => {
-    props.tracker.revision()
-    return props.tracker.session(props.session.id) ?? props.session
-  })
-  const watch = createMemo(() => {
-    props.tracker.supervision()
-    return props.supervisor.record(props.session.id)
-  })
-  const watchConfig = createMemo(() => {
-    props.tracker.supervision()
-    return props.supervisor.snapshot().config
-  })
-  const watchLabel = createMemo(() => watchSummary(watch(), watchConfig()))
-  const watchColor = createMemo(() => {
-    const status = watch()?.status
-    if (status === "failed" || status === "restart_limit") return theme().text.feedback.error.base
-    if (status === "timed_out") return theme().text.feedback.warning.base
-    if (status === "recovering") return theme().text.feedback.info.base
-    if (status === "restarted") return theme().text.feedback.success.base
-    return theme().text.muted
-  })
-  const canRestart = createMemo(() => {
-    props.tracker.now()
-    props.tracker.supervision()
-    return props.supervisor.canRestart(props.session.id)
-  })
-  const status = createMemo(() => {
-    props.tracker.revision()
-    return props.live.get(props.session.id)
-  })
-  const messages = createMemo(() => {
-    props.tracker.revision()
-    return ctx.data.session.message.list(props.session.id)
-  })
-  const lastAssistant = createMemo(() =>
-    messages().findLast((item): item is SessionMessageAssistant => item.type === "assistant"),
-  )
-  const parts = createMemo(() => lastAssistant()?.content ?? [])
-  const running = createMemo(() =>
-    parts().some(
-      (item) =>
-        item.type === "tool" && (item.state.status === "running" || item.state.status === "streaming"),
-    ),
-  )
-  const tool = createMemo(() =>
-    parts().findLast((item): item is SessionMessageAssistantTool => item.type === "tool"),
-  )
-  const state = createMemo(() => {
-    const current = status()
-    if (current === "retry") return { label: "retry", color: theme().text.feedback.error.base }
-    if (current === "busy") {
-      if (running()) return { label: "tool", color: theme().text.feedback.warning.base }
-      return { label: "thinking", color: theme().text.feedback.info.base }
-    }
-    if (lastAssistant()?.finish) return { label: "done", color: theme().text.muted }
-    return { label: "idle", color: theme().text.muted }
-  })
-  const stateAbbr = createMemo(() => {
-    const table: Record<string, string> = {
-      thinking: "think",
-      tool: "tool",
-      done: "done",
-      idle: "idle",
-      retry: "retry",
-    }
-    return table[state().label] ?? state().label
-  })
-  const model = createMemo(() => lastAssistant()?.model.id ?? session().model?.id ?? "?")
-  const tokens = createMemo(() => {
-    const item = messages().findLast(
-      (message): message is SessionMessageAssistant =>
-        message.type === "assistant" && (message.tokens?.output ?? 0) > 0,
-    )
-    return item?.tokens ? tokenTotal(item.tokens) : session().tokens ? tokenTotal(session().tokens) : 0
-  })
-  const elapsedMs = createMemo(() => {
-    const current = session()
-    const start = current.time.busy
-    if (status() === "busy" || status() === "retry") {
-      return props.tracker.now() - (start ?? current.time.created)
-    }
-    if (start !== undefined && current.time.idle !== undefined && current.time.idle >= start) {
-      return current.time.idle - start
-    }
-    if (current.time.idle !== undefined) return Math.max(0, current.time.idle - current.time.created)
-    return undefined
-  })
-  const open = createMemo(() => props.tracker.expanded(props.session.id, false))
-
-  // Breathing indicator (ASCII only), driven by the tracker's 1s `now` tick.
-  const phase = createMemo(() => props.tracker.breathing() % 4)
-  const indicator = createMemo(() => {
-    const label = state().label
-    if (label === "retry") return phase() % 2 === 0 ? "!" : "."
-    if (label === "thinking" || label === "tool") return [".", "o", "O", "o"][phase()]
-    return "-"
-  })
-
-  async function requestRestart() {
-    const record = watch()
-    if (!record || !props.supervisor.canRestart(record.session_id)) return
-
-    if (props.supervisor.snapshot().config.confirmFirstRestart) {
-      const confirmed = await ctx.ui.dialog.confirm({
-        title: "Restart agent",
-        message: `Restart ${agentName(session())} now? The current run will be interrupted and resumed from the workspace state.`,
-        label: { confirm: "Restart", cancel: "Cancel" },
-      })
-      if (!confirmed) return
-    }
-
-    const result = await props.supervisor.restart(record.session_id)
-    if (!result.ok) {
-      ctx.ui.toast.show({
-        variant: "warning",
-        title: "Agents Watcher",
-        message: `Restart skipped: ${result.reason ?? "not eligible"}`,
-      })
-    }
-  }
-
-  return (
-    <box marginBottom={1}>
-      <box flexDirection="row" justifyContent="space-between" width="100%">
-        <box
-          flexDirection="row"
-          gap={1}
-          onMouseDown={() => props.tracker.toggleExpanded(props.session.id, false)}
-        >
-          <text fg={state().color}>{indicator()}</text>
-          <text fg={theme().text.base}>
-            <b>{stateAbbr()} [{agentName(session())}]</b>
-          </text>
-        </box>
-        <box flexDirection="row" gap={1}>
-          <Show when={canRestart()}>
-            <box onMouseUp={() => void requestRestart()}>
-              <text fg={theme().text.feedback.warning.base}>[restart]</text>
-            </box>
-          </Show>
-          <box onMouseDown={() => ctx.ui.router.navigate({ type: "session", sessionID: props.session.id })}>
-            <text fg={theme().text.action.primary.base}>[view]</text>
-          </box>
-        </box>
-      </box>
-      <text fg={theme().text.muted}>
-        {`  ${agentDesc(session())} ${formatTokens(tokens())} ${
-          elapsedMs() !== undefined ? formatElapsed(elapsedMs()!) : "-"
-        }`}
-      </text>
-      <Show when={watchLabel()}>
-        <text fg={watchColor()}>  {watchLabel()}</text>
-      </Show>
-      <Show when={watch()?.error}>
-        <text fg={theme().text.feedback.error.base}>  {truncate(watch()!.error!, 64)}</text>
-      </Show>
-      <Show when={open()}>
-        <text fg={theme().text.muted}>  model: {model()}</text>
-        <text fg={theme().text.muted}>  tool: {tool() ? toolSummary(tool()!) : "-"}</text>
-        <text fg={theme().text.muted}>  cost: {money.format(session().cost ?? 0)}</text>
-      </Show>
-    </box>
-  )
+function toolSummary(part: SessionMessageAssistantTool) {
+  const input = part.state.input
+  const record = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {}
+  const detail = record.description ?? record.command ?? record.filePath ?? record.path ?? record.pattern ?? ""
+  const text = detail ? `${part.name} ${String(detail).split("\n")[0]}` : part.name
+  return truncate(text, 60)
 }
 
-function View(props: {
-  ctx: TuiContext
-  tracker: Tracker
-  supervisor: Supervisor
-  live: Live
-  session_id: string
-}) {
+function Lines(props: { lines: string[]; color: Color }) {
+  return <For each={props.lines}>{(line) => <text fg={props.color}>{line}</text>}</For>
+}
+
+// A collapsible section: "▼ Providers · 199k tokens".
+function Section(props: { ctx: TuiContext; tracker: Tracker; id: SectionID; title: string; summary: string; children: JSX.Element }) {
   const theme = () => props.ctx.theme
-  createEffect(() => {
-    props.supervisor.watchParent(props.session_id)
-  })
-  const watch = createMemo(() => {
-    props.tracker.supervision()
-    return props.supervisor.snapshot()
-  })
-  const watchHeader = createMemo(() => {
-    const current = watch()
-    if (current.config.enabled) {
-      return `watch ${formatDurationShort(current.config.agentsTimeoutMs)} ${current.config.timeoutMode.replace("_", "-")}`
-    }
-    return undefined
-  })
-  const active = createMemo(() => props.tracker.active(props.session_id))
-  const archived = createMemo(() => props.tracker.archived(props.session_id))
-  const total = () => active().length + archived().length
-  const archivedTotalPages = createMemo(() => Math.max(1, Math.ceil(archived().length / ARCHIVED_PAGE_SIZE)))
-  const archivedPage = createMemo(() => props.tracker.archivedPage(props.session_id))
-  const archivedItems = createMemo(() => {
-    const start = archivedPage() * ARCHIVED_PAGE_SIZE
-    return archived().slice(start, start + ARCHIVED_PAGE_SIZE)
-  })
-
   return (
     <box marginBottom={1}>
-      <box flexDirection="row" gap={1} onMouseDown={() => props.tracker.toggleCollapsed()}>
-        <text fg={theme().text.base}>{props.tracker.collapsed() ? "▶" : "▼"}</text>
+      <box flexDirection="row" gap={1} onMouseDown={() => props.tracker.toggleCollapsed(props.id)}>
+        <text fg={theme().text.base}>{props.tracker.collapsed(props.id) ? "▶" : "▼"}</text>
         <text fg={theme().text.base}>
-          <b>Agents</b>
+          <b>{props.title}</b>
         </text>
-        <text fg={theme().text.muted}>
-          {active().length} active {archived().length} done
-        </text>
+        <text fg={theme().text.muted}>{props.summary}</text>
       </box>
-      <Show when={watchHeader()}>
-        <text fg={theme().text.muted} marginBottom={1}>  {watchHeader()}</text>
-      </Show>
-      <Show when={watch().warnings.length > 0}>
-        <For each={watch().warnings.slice(0, 2)}>
-          {(warning) => <text fg={theme().text.feedback.warning.base}>  ! {truncate(warning, 64)}</text>}
-        </For>
-      </Show>
-      <Show when={!props.tracker.collapsed()}>
-        <Show when={total() > 0} fallback={<text fg={theme().text.muted}>No subagents yet</text>}>
-          <For each={active()}>
-            {(child) => (
-              <Agent
-                ctx={props.ctx}
-                tracker={props.tracker}
-                supervisor={props.supervisor}
-                live={props.live}
-                session={child}
-              />
-            )}
-          </For>
-          <Show when={archived().length > 0}>
-            <box flexDirection="row" gap={1} onMouseDown={() => props.tracker.toggleArchived()}>
-              <text fg={theme().text.muted}>{props.tracker.showArchived() ? "▼" : "▶"}</text>
-              <text fg={theme().text.muted}>Archived ({archived().length})</text>
-            </box>
-            <Show when={props.tracker.showArchived()}>
-              <For each={archivedItems()}>
-                {(child) => (
-                  <Agent
-                    ctx={props.ctx}
-                    tracker={props.tracker}
-                    supervisor={props.supervisor}
-                    live={props.live}
-                    session={child}
-                  />
-                )}
-              </For>
-              <Show when={archivedTotalPages() > 1}>
-                <box flexDirection="row" gap={1}>
-                  <text
-                    fg={
-                      archivedPage() > 0
-                        ? theme().text.action.primary.base
-                        : theme().text.muted
-                    }
-                    onMouseDown={() => props.tracker.setArchivedPage(props.session_id, archivedPage() - 1)}
-                  >
-                    [&lt;]
-                  </text>
-                  <text fg={theme().text.muted}>
-                    {archivedPage() + 1}/{archivedTotalPages()}
-                  </text>
-                  <text
-                    fg={
-                      archivedPage() < archivedTotalPages() - 1
-                        ? theme().text.action.primary.base
-                        : theme().text.muted
-                    }
-                    onMouseDown={() => props.tracker.setArchivedPage(props.session_id, archivedPage() + 1)}
-                  >
-                    [&gt;]
-                  </text>
-                </box>
-              </Show>
-            </Show>
-          </Show>
-        </Show>
-      </Show>
+      <Show when={!props.tracker.collapsed(props.id)}>{props.children}</Show>
     </box>
   )
 }
 
-function observed(session: SessionInfo): ObservedSession {
-  return {
-    id: session.id,
-    parentID: session.parentID,
-    title: session.title ?? "",
-    agent: session.agent,
-    time: { created: session.time.created, updated: session.time.updated },
-    model: session.model,
+// One agent run: header, model, variant, stats, tasks, background jobs, and
+// the current tool while it runs.
+function Run(props: { ctx: TuiContext; tracker: Tracker; live: Live; run: AgentRun }) {
+  const theme = () => props.ctx.theme
+  const run = () => props.run
+  const running = createMemo(() => run().runningSince !== undefined && props.live.busy(run().sessionID))
+  const color = () =>
+    running() ? theme().text.feedback.info.base : run().failed ? theme().text.feedback.error.base : theme().text.base
+  // "12:37 implementer", plus "running" or "failed".
+  const head = createMemo(() => {
+    const status = running() ? " running" : run().failed ? " failed" : ""
+    return wrap(`${formatClock(run().start)} ${run().agent}${status}`, LINE_WIDTH)
+  })
+  // Provider and model, then the variant and what it does.
+  const model = createMemo(() => {
+    const current = run().model
+    if (!current) return wrap("unknown model", LINE_WIDTH, "  ")
+    const facts = props.tracker.facts(current)
+    const summary = variantSummary(facts, current.variant)
+    return [
+      ...wrap(`${facts?.provider ?? current.providerID} · ${displayName(facts, current)}`, LINE_WIDTH, "  ", "    "),
+      ...(current.variant ? wrap(summary ? `${current.variant} · ${summary}` : current.variant, LINE_WIDTH, "  ") : []),
+    ]
+  })
+  // The only line that changes every second while the run is running.
+  const stats = () => {
+    const since = run().runningSince
+    const busy = run().busy + (since !== undefined && running() ? props.tracker.now() - since : 0)
+    return wrap(formatStats(busy, run().generated, run().streaming), LINE_WIDTH, "  ")
   }
+  const tasks = createMemo(() => {
+    const list = run().tasks
+    if (list.length === 1) return clamp(wrap(list[0]!, LINE_WIDTH, "  "), TASK_LINES, LINE_WIDTH)
+    return list.flatMap((task, index) => {
+      const number = `  ${index + 1}. `
+      return clamp(wrap(task, LINE_WIDTH, number, " ".repeat(number.length)), TASK_LINES, LINE_WIDTH)
+    })
+  })
+  const jobs = () => (run().jobs > 0 ? [`  ${run().jobs} background job${run().jobs === 1 ? "" : "s"}`] : [])
+  const now = createMemo(() => {
+    if (!running()) return []
+    const messages = props.tracker.messages(run().sessionID)
+    const last = messages.findLast((item) => item.type === "assistant") as SessionMessageAssistant | undefined
+    const part = last?.content.findLast((item): item is SessionMessageAssistantTool => item.type === "tool")
+    return clamp(wrap(`now: ${part ? toolSummary(part) : "thinking"}`, LINE_WIDTH, "  ", "    "), TASK_LINES, LINE_WIDTH)
+  })
+  return (
+    <box marginBottom={1} onMouseDown={() => props.ctx.ui.router.navigate({ type: "session", sessionID: run().sessionID })}>
+      <Lines lines={head()} color={color()} />
+      <Lines lines={model()} color={theme().text.muted} />
+      <Lines lines={stats()} color={theme().text.muted} />
+      <Lines lines={tasks()} color={theme().text.base} />
+      <Lines lines={jobs()} color={theme().text.muted} />
+      <Lines lines={now()} color={theme().text.feedback.warning.base} />
+    </box>
+  )
+}
+
+function Sidebar(props: { ctx: TuiContext; tracker: Tracker; live: Live; sessionID: string }) {
+  const theme = () => props.ctx.theme
+  const children = createMemo(() => props.tracker.children(props.sessionID))
+  const parent = createMemo(() => props.tracker.messages(props.sessionID))
+  const calls = createMemo(() => subagentCalls(parent()))
+
+  // Every model call in the session tree, as runs in the order they started.
+  const runs = createMemo(() =>
+    agentRuns([
+      // The orchestrator's turns count too; each round is attributed to the agent
+      // of its steps, so agent switches and compactions show as theirs.
+      { sessionID: props.sessionID, agent: "orchestrator", messages: parent(), newRunPerPrompt: true },
+      ...children().map((child) => ({
+        sessionID: child.id,
+        agent: child.agent ?? "agent",
+        messages: props.tracker.messages(child.id),
+        calls: calls().filter((call) => call.sessionID === child.id),
+      })),
+    ]),
+  )
+  // Newest first: the running run sits on top.
+  const shown = createMemo(() => {
+    const newest = [...runs()].reverse()
+    return props.tracker.showAll(props.sessionID) ? newest : newest.slice(0, VISIBLE_RUNS)
+  })
+  const hidden = () => runs().length - shown().length
+
+  const providers = createMemo(() =>
+    providerUsage([parent(), ...children().map((child) => props.tracker.messages(child.id))]),
+  )
+  const total = () => providers().reduce((sum, usage) => sum + usage.generated, 0)
+  // The provider, then time · tokens · speed like a run, ending with its share.
+  const providerLines = createMemo(() =>
+    providers().flatMap((usage) => [
+      ...wrap(props.tracker.provider(usage.providerID), LINE_WIDTH),
+      ...wrap(`${formatStats(usage.time, usage.generated, usage.streaming)} · ${Math.round(usage.share * 100)}%`, LINE_WIDTH, "  "),
+    ]),
+  )
+
+  return (
+    <Show when={runs().length > 0}>
+      <Section ctx={props.ctx} tracker={props.tracker} id="providers" title="Providers" summary={`· ${formatTokens(total())} tokens`}>
+        <Lines lines={providerLines()} color={theme().text.muted} />
+      </Section>
+      <Section
+        ctx={props.ctx}
+        tracker={props.tracker}
+        id="agents"
+        title="Agents"
+        summary={`· ${runs().length} run${runs().length === 1 ? "" : "s"}`}
+      >
+        {/* Index, not For: runs are rebuilt on every redraw, so match them by position. */}
+        <Index each={shown()}>{(run) => <Run ctx={props.ctx} tracker={props.tracker} live={props.live} run={run()} />}</Index>
+        <Show when={hidden() > 0 || runs().length > VISIBLE_RUNS}>
+          <box onMouseDown={() => props.tracker.toggleShowAll(props.sessionID)}>
+            <text fg={theme().text.action.primary.base}>
+              {hidden() > 0 ? `${hidden()} older, click to show all` : "click to show recent only"}
+            </text>
+          </box>
+        </Show>
+      </Section>
+    </Show>
+  )
 }
 
 export default Plugin.define({
-  id: "agents-sidebar",
+  id: "agents-watch",
   setup(ctx) {
-    const projectRoot =
-      ctx.location?.directory ?? ctx.data.location.default().directory ?? process.cwd()
     const live = createLive(ctx)
-    let supervisor: Supervisor | undefined
-
-    const tracker = createTracker(
-      ctx,
-      {
-        onSession: (session) => supervisor?.observe(observed(session)),
-        onDeleted: (sessionID) => supervisor?.remove(sessionID),
-      },
-      live,
-    )
-
-    const store = createFileStateStore(projectRoot)
-
-    async function loadDetails(sessionID: string): Promise<SessionDetails | undefined> {
-      try {
-        await ctx.data.session.message.sync(sessionID)
-        let list = ctx.data.session.message.list(sessionID)
-        if (list.length === 0) {
-          const response = await ctx.client.message.list({ sessionID })
-          list = response.data
-        }
-        const user = list.find((item) => item.type === "user")
-        const assistant = list.findLast((item) => item.type === "assistant")
-        const prompt =
-          user && user.type === "user"
-            ? user.text.trim()
-            : ""
-        const model =
-          assistant && assistant.type === "assistant"
-            ? `${assistant.model.providerID}/${assistant.model.id}`
-            : undefined
-        const agent =
-          assistant && assistant.type === "assistant"
-            ? assistant.agent
-            : ctx.data.session.get(sessionID)?.agent
-        return {
-          prompt: prompt ? prompt.slice(0, 8_000) : undefined,
-          agent,
-          model,
-        }
-      } catch {
-        return undefined
-      }
-    }
-
-    supervisor = createSupervisor({
-      config: () => ({
-        config: { ...DEFAULT_CONFIG, enabled: false },
-        warnings: [],
-        exists: false,
-        path: `${projectRoot}/.opencode/monitor.json`,
-      }),
-      reloadConfig: () => readMonitorConfig(projectRoot),
-      getStatus: (sessionID) => live.get(sessionID),
-      isBlocked: (sessionID) => {
-        const permissions = ctx.data.session.permission.list(sessionID)
-        if (permissions && permissions.length > 0) return true
-        const forms = ctx.data.session.form.list(sessionID, ctx.location)
-        return !!forms && forms.length > 0
-      },
-      store,
-      loadDetails,
-      notify: () => tracker.bumpSupervision(),
-      client: {
-        async abortSession(sessionID) {
-          await ctx.client.session.interrupt({ sessionID })
-        },
-        async promptSession(sessionID, text) {
-          await ctx.client.session.prompt({ sessionID, text })
-        },
-        async createChildSession(input) {
-          const session = await ctx.client.session.create({
-            parentID: input.parentID,
-            title: input.title,
-            agent: input.agent,
-            model: input.model
-              ? { id: input.model.modelID, providerID: input.model.providerID }
-              : undefined,
-          })
-          return { id: session.id }
-        },
-      },
-    })
-
-    for (const session of ctx.data.session.list()) {
-      if (session.parentID) supervisor.observe(observed(session))
-    }
-    void supervisor.start()
-
-    const stopActivity = ctx.data.listen(({ details }) => {
-      if (!ACTIVITY_EVENT.test(details.type)) return
-      const sessionID = (details.data as { sessionID?: unknown } | undefined)?.sessionID
-      if (typeof sessionID === "string") supervisor?.activity(sessionID)
-    })
-
-    ctx.keymap.layer(() => ({
-      mode: "global",
-      priority: 10,
-      commands: [
-        {
-          id: "agents-watcher.cleanup",
-          title: "Clean Agents Watcher session data",
-          description: "Delete persisted Agents Watcher data for this project",
-          group: "Agents Watcher",
-          palette: true,
-          slash: { name: "aw-cleanup" },
-          run: async () => {
-            const confirmed = await ctx.ui.dialog.confirm({
-              title: "Clean Agents Watcher data",
-              message: "Delete all persisted session data from .opencode/agents-watcher?",
-              label: { confirm: "Delete", cancel: "Cancel" },
-            })
-            if (!confirmed) return
-            try {
-              await supervisor?.clear()
-              ctx.ui.toast.show({
-                variant: "success",
-                title: "Agents Watcher",
-                message: "Persisted session data cleaned.",
-              })
-            } catch (error) {
-              ctx.ui.toast.show({
-                variant: "error",
-                title: "Agents Watcher",
-                message: `Cleanup failed: ${errorMessage(error, "could not remove session data")}`,
-              })
-            }
-          },
-        },
-      ],
-    }))
+    const tracker = createTracker(ctx)
 
     const unregisterSlot = ctx.ui.slot({
       append: "sidebar.content",
-      render: ({ sessionID }) => (
-        <View ctx={ctx} tracker={tracker} supervisor={supervisor!} live={live} session_id={sessionID} />
-      ),
+      render: ({ sessionID }) => <Sidebar ctx={ctx} tracker={tracker} live={live} sessionID={sessionID} />,
     })
 
     return () => {
       unregisterSlot()
-      stopActivity()
-      supervisor?.dispose()
       tracker.dispose()
       live.dispose()
     }

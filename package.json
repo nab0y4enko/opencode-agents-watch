@@ -1,18 +1,10 @@
 {
-  "name": "opencode-agents-watcher",
-  "version": "0.2.0",
+  "name": "opencode-agents-watch",
+  "version": "0.1.0",
   "type": "module",
-  "description": "OpenCode TUI plugin - watch sub-agent status and recovery in the sidebar",
-  "author": "RainingDaemons",
+  "description": "OpenCode TUI sidebar: tokens, time and speed per provider, and every agent run with its model and tasks",
+  "author": "Oleksii Naboichenko",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/RainingDaemons/opencode-agents-watcher.git"
-  },
-  "bugs": {
-    "url": "https://github.com/RainingDaemons/opencode-agents-watcher/issues"
-  },
-  "homepage": "https://github.com/RainingDaemons/opencode-agents-watcher",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -21,20 +13,18 @@
     "sidebar"
   ],
   "engines": {
-    "opencode": ">=2.0.0"
+    "opencode": ">=2.3.0"
   },
   "exports": {
     "./tui": "./dist/index.js"
   },
   "files": [
-    "dist",
-    "assets",
-    "monitor.json.example"
+    "dist"
   ],
   "scripts": {
-    "build": "bun run script/build.mjs",
+    "build": "BUN_BE_BUN=1 opencode run script/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "BUN_BE_BUN=1 opencode test"
   },
   "dependencies": {
     "@opencode/client": "^2.3.0",
@@ -52,5 +42,6 @@
     "@types/bun": "^1.3.0",
     "solid-js": "^1.9.12",
     "typescript": "^5.9.0"
-  }
+  },
+  "private": true
 }
