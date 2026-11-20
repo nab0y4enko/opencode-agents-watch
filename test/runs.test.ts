@@ -95,6 +95,14 @@ describe("rounds", () => {
     ])
   })
 
+  test("streaming time stops when the stream ends, not when the step's tools finish", () => {
+    const timed: Message = { type: "assistant", time: { created: 0, firstToken: 3000, streamed: 5000, completed: 65000 }, model: worker, tokens: tokens(190), content: [] }
+    const result = rounds([user(0, "Go"), timed, idle(66000)])
+    expect(result[0]!.streaming).toBe(2000)
+    expect(speed(result[0]!.generated, result[0]!.streaming)).toBe(100)
+    expect(providerUsage([[timed]])[0]!.streaming).toBe(2000)
+  })
+
   test("streaming time counts first token to completion only", () => {
     const timed: Message = { type: "assistant", time: { created: 0, firstToken: 3000, completed: 5000 }, model: worker, tokens: tokens(190), content: [] }
     const result = rounds([user(0, "Go"), timed, idle(6000)])

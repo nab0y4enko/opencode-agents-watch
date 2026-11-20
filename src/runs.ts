@@ -14,7 +14,7 @@ export type Message =
   | { type: "compaction"; time: { created: number }; status?: string; model?: Model; tokens?: Tokens }
   | {
       type: "assistant"
-      time: { created: number; firstToken?: number; completed?: number }
+      time: { created: number; firstToken?: number; streamed?: number; completed?: number }
       agent?: string
       model: Model
       tokens?: Tokens
@@ -38,10 +38,13 @@ export function generated(tokens: Tokens | undefined) {
   return tokens ? tokens.output + tokens.reasoning : 0
 }
 
-// First token to completion; excludes prompt processing.
+// First token to the end of the stream; excludes prompt processing and the
+// step's tool execution (`completed` is stamped only after the tools finish).
+// Falls back to `completed` for messages recorded without `streamed`.
 function streamingTime(message: Assistant) {
-  const { firstToken, completed } = message.time
-  return firstToken !== undefined && completed !== undefined ? Math.max(0, completed - firstToken) : 0
+  const { firstToken, streamed, completed } = message.time
+  const end = streamed ?? completed
+  return firstToken !== undefined && end !== undefined ? Math.max(0, end - firstToken) : 0
 }
 
 // Generated tokens per second of streaming; undefined when nothing streamed yet.
