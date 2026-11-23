@@ -1,6 +1,6 @@
 # opencode-agents-watch
 
-An OpenCode 2 TUI sidebar for orchestrator/worker runs. Forked from
+An OpenCode 2 sidebar for orchestrator/worker runs, in the terminal UI and the desktop app. Forked from
 [opencode-agents-watcher](https://github.com/RainingDaemons/opencode-agents-watcher) (MIT); the restart
 supervisor and its `.opencode/` state files are gone, so this version only displays.
 
@@ -67,6 +67,21 @@ echo "export { default } from \"$PWD/dist/index.js\"" > ~/.config/opencode/plugi
 
 Restart OpenCode; the widget sits in the session sidebar (`ctrl+x` `b` toggles the sidebar).
 
+### Desktop app
+
+The desktop app can't show TUI plugins; it loads the plugin's `./gui-experimental` bundle instead (the
+GUI plugin API is experimental upstream). Copy the bundle next to `tui.tsx`, and copy it again after each
+build. A symlink won't work: the server ignores a bundle whose real path is outside the plugin folder.
+
+```sh
+cp dist/gui-experimental.cjs ~/.config/opencode/plugins/agents-watch/
+```
+
+The server reads the plugins folder when it starts, so restart it (`opencode service restart`) and then the
+app; `opencode api GET /api/plugin` should list `agents-watch` with `gui: true`. In a session, open **Agents** from the side
+panel's + menu or with the "Toggle Agents panel" command; the session header shows the session's tokens
+and running agents, and a click on it toggles the panel. Click a run to open its session.
+
 ## Develop
 
 Bun comes inside the OpenCode binary (`BUN_BE_BUN=1 opencode …`), so no separate install is needed.
@@ -74,5 +89,5 @@ Bun comes inside the OpenCode binary (`BUN_BE_BUN=1 opencode …`), so no separa
 ```sh
 npm test            # runs, provider totals, names and formatting (src/runs.ts)
 npm run typecheck
-npm run build       # writes dist/index.js; rebuild and restart OpenCode after changes
+npm run build       # writes dist/index.js and dist/gui-experimental.cjs; rebuild and restart OpenCode after changes
 ```

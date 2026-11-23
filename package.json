@@ -2,7 +2,7 @@
   "name": "opencode-agents-watch",
   "version": "0.1.0",
   "type": "module",
-  "description": "OpenCode TUI sidebar: tokens, time and speed per provider, and every agent run with its model and tasks",
+  "description": "OpenCode sidebar for the TUI and desktop app: tokens, time and speed per provider, and every agent run with its model and tasks",
   "author": "Oleksii Naboichenko",
   "license": "MIT",
   "keywords": [
@@ -16,13 +16,14 @@
     "opencode": ">=2.3.0"
   },
   "exports": {
-    "./tui": "./dist/index.js"
+    "./tui": "./dist/index.js",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "BUN_BE_BUN=1 opencode run script/build.mjs",
+    "build": "BUN_BE_BUN=1 opencode run script/build.mjs && BUN_BE_BUN=1 opencode run script/build-gui.mjs",
     "typecheck": "tsc --noEmit",
     "test": "BUN_BE_BUN=1 opencode test"
   },
